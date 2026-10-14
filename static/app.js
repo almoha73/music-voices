@@ -346,9 +346,10 @@ function buildTracksUI(song) {
   const container = document.getElementById("tracks-container");
   container.innerHTML = "";
 
+  const ver = song.version || song.created_at || 1;
   for (const stem of song.stems) {
-    const wavUrl = `/library/${song.id}/${stem.wav_file}`;
-    const mp3Url = `/library/${song.id}/${stem.mp3_file}`;
+    const wavUrl = `/library/${song.id}/${stem.wav_file}?v=${encodeURIComponent(ver)}`;
+    const mp3Url = `/library/${song.id}/${stem.mp3_file}?v=${encodeURIComponent(ver)}`;
 
     const audioEl = new Audio(wavUrl);
     audioEl.preload = "auto";
@@ -577,7 +578,7 @@ async function playAllTracks() {
   const masterTime = getMasterCurrentTime();
   for (const n of Object.values(trackNodes)) {
     n.audio.playbackRate = playbackRate;
-    if (Math.abs(n.audio.currentTime - masterTime) > 0.05) {
+    if (Math.abs(n.audio.currentTime - masterTime) > 0.015) {
       n.audio.currentTime = masterTime;
     }
   }
@@ -589,6 +590,18 @@ async function playAllTracks() {
   const btnPlay = document.getElementById("btn-play");
   btnPlay.textContent = "⏸ Pause";
   btnPlay.classList.add("playing");
+
+  // Alignement fin post-démarrage (élimine tout décalage/écho de 20-80ms entre les pistes au lancement)
+  setTimeout(() => {
+    if (!isPlaying) return;
+    const t = getMasterCurrentTime();
+    for (const n of Object.values(trackNodes)) {
+      if (!n.audio.seeking && Math.abs(n.audio.currentTime - t) > 0.012) {
+        n.audio.currentTime = t;
+      }
+    }
+  }, 90);
+
   startRenderLoop();
 }
 
@@ -622,14 +635,14 @@ function startRenderLoop() {
     if (loopEnabled && loopA !== null && loopB !== null && t >= loopB) {
       seekAllTracks(loopA);
     } else {
-      // Resynchronisation douce (maximum 1 fois par seconde et seulement si l'écart dépasse 120 ms)
-      if (now - lastSyncTimestamp > 1000) {
+      // Resynchronisation anti-écho (toutes les 1.2s si l'écart dépasse 30 ms)
+      if (now - lastSyncTimestamp > 1200) {
         lastSyncTimestamp = now;
         for (const n of Object.values(trackNodes)) {
           if (n.audio.paused && !n.audio.ended && !n.audio.seeking) {
             n.audio.play().catch(() => {});
           }
-          if (!n.audio.seeking && Math.abs(n.audio.currentTime - t) > 0.12) {
+          if (!n.audio.seeking && Math.abs(n.audio.currentTime - t) > 0.03) {
             n.audio.currentTime = t;
           }
         }
