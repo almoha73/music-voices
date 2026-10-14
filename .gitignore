@@ -1,0 +1,13 @@
+# Environnement virtuel Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Fichiers audio de travail et bibliothèque locale
+library/
+uploads/
+
+# Modèles ONNX lourds (téléchargés automatiquement dans ./models/ au premier besoin)
+models/*.onnx
+!models/mdx_model_data.json

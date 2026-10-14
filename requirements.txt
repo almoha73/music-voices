@@ -1,0 +1,10 @@
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9
+numpy>=1.26.0
+scipy>=1.12.0
+soundfile>=0.12.1
+librosa>=0.10.1
+onnxruntime>=1.17.0
+requests>=2.31.0
+audio-separator>=0.17.0

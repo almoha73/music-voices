@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Atelier Voix — Séparation Vocale &amp; Studio de Répétition</title>
+  <link rel="stylesheet" href="/static/styles.css?v=2" />
+</head>
+<body>
+  <header class="top-header">
+    <div class="brand">
+      <div class="brand-icon" aria-hidden="true">🎙️</div>
+      <div>
+        <h1>Atelier Voix</h1>
+        <p class="subtitle">Séparation des voix humaines &amp; studio d'apprentissage multipiste</p>
+      </div>
+    </div>
+    <div class="hw-badge" id="hw-badge" title="Configuration matérielle détectée automatiquement sur cet ordinateur Linux">
+      <span class="hw-dot"></span>
+      <span id="hw-text">Détection du matériel Linux...</span>
+    </div>
+  </header>
+
+  <main class="app-layout">
+    <!-- COLONNE GAUCHE : Importation & Bibliothèque -->
+    <aside class="sidebar">
+      <section class="card">
+        <h2>1. Séparer un nouveau chant</h2>
+
+        <div class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="Choisir ou glisser un fichier audio MP3 ou WAV">
+          <input type="file" id="file-input" accept=".mp3,.wav,.flac,.ogg,.m4a,audio/*" hidden />
+          <div class="dropzone-icon" aria-hidden="true">🎵</div>
+          <p class="dropzone-title" id="selected-file-label">Glisse ton fichier <strong>MP3 / WAV</strong> ici</p>
+          <p class="dropzone-hint">ou clique pour parcourir ton ordinateur</p>
+        </div>
+
+        <div class="form-group">
+          <label for="mode-select">Type de voix dans le morceau :</label>
+          <select id="mode-select" class="select-input">
+            <option value="lead_2choirs">👥 3 Voix : Voix Principale + Chœur 1 (Haute) + Chœur 2 (Basse)</option>
+            <option value="lead_backing">🎤 2 Voix : Voix Principale (Lead) + Chœurs groupés</option>
+            <option value="duet_pitch">🎶 Duo Harmonisé : Voix Haute (Aiguë) / Voix Basse (Grave)</option>
+            <option value="duet_stereo">🎧 Duo Spatial : Voix Gauche-Centre / Voix Droite-Côtés</option>
+          </select>
+          <small class="field-help" id="mode-help">
+            Idéal quand il y a un chanteur principal + 2 personnes qui chantent les chœurs en harmonie (ex: Wagon Wheel) : crée 4 pistes !
+          </small>
+        </div>
+
+        <div class="form-group">
+          <label for="engine-select">Moteur de découpage :</label>
+          <select id="engine-select" class="select-input">
+            <option value="ai_hq">🧠 IA Haute Précision (Ultimate Vocal Remover MDX-Net — Recommandé)</option>
+            <option value="fast_dsp">⚡ Rapide &amp; Hors-ligne (Spectral &amp; Harmonique — ~15 sec)</option>
+          </select>
+        </div>
+
+        <div class="action-buttons">
+          <button type="button" id="btn-separate" class="btn btn-primary" disabled>
+            ✂️ Séparer les voix maintenant
+          </button>
+          <button type="button" id="btn-demo" class="btn btn-secondary">
+            ✨ Tester avec un Duo de démonstration
+          </button>
+        </div>
+
+        <!-- Barre de progression -->
+        <div class="progress-box" id="progress-box" hidden>
+          <div class="progress-header">
+            <span id="progress-status">Traitement en cours...</span>
+            <strong id="progress-pct">0%</strong>
+          </div>
+          <div class="progress-bar-bg">
+            <div class="progress-bar-fill" id="progress-bar-fill" style="width: 0%"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card library-card">
+        <div class="card-header-row">
+          <h2>Mes chants découpés</h2>
+          <span class="badge-count" id="song-count">0</span>
+        </div>
+        <p class="small-note">Sauvegardés sur le disque : aucune attente pour les réécouter.</p>
+        <ul class="song-list" id="song-list" aria-label="Bibliothèque des morceaux séparés">
+          <li class="empty-library">Aucun morceau pour l'instant. Importe un MP3 ou lance la Démo !</li>
+        </ul>
+      </section>
+    </aside>
+
+    <!-- COLONNE DROITE : Studio de Répétition Multipiste -->
+    <section class="studio-area">
+      <div class="card empty-studio" id="empty-studio">
+        <div class="empty-studio-content">
+          <div class="empty-icon" aria-hidden="true">🎚️</div>
+          <h2>Bienvenue dans ton Studio de Travail Vocal</h2>
+          <p>
+            Importe un fichier <strong>MP3</strong> à gauche (ou clique sur
+            <em>« Tester avec un Duo de démonstration »</em>) pour afficher la table de mixage
+            avec <strong>Voix 1</strong>, <strong>Voix 2</strong>, <strong>Voix 3</strong> et <strong>Musique</strong> séparées.
+          </p>
+          <div class="feature-pills">
+            <span>🎤 Volume indépendant par voix</span>
+            <span>🎧 Balance Gauche / Droite au casque</span>
+            <span>🔁 Boucle A–B sur un passage</span>
+            <span>🐢 Ralentisseur sans changer la note</span>
+            <span>💾 Export MP3 &amp; WAV</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="studio-workspace" id="studio-workspace" hidden>
+        <!-- En-tête du morceau actif & Préréglages Chanteur -->
+        <div class="card studio-header-card">
+          <div class="song-title-row">
+            <div>
+              <span class="song-badge" id="active-song-mode">Mode Duo</span>
+              <h2 id="active-song-title">Titre du morceau</h2>
+            </div>
+            <div class="export-mix-group">
+              <button type="button" id="btn-split-choir" class="btn btn-secondary" title="Séparer la piste Chœurs actuelle en 2 voix distinctes (Chœur 1 Haute + Chœur 2 Basse) en ~25 secondes sans refaire l'IA" hidden>
+                🎶 Diviser les Chœurs en 2 voix (Haute / Basse)
+              </button>
+              <button type="button" id="btn-export-mix-mp3" class="btn btn-accent" title="Télécharger un fichier MP3 unique avec tes réglages actuels de volume et de balance">
+                💾 Exporter mon mix d'entraînement (MP3)
+              </button>
+              <button type="button" id="btn-export-mix-wav" class="btn btn-outline" title="Télécharger en qualité WAV non compressée">
+                WAV
+              </button>
+            </div>
+          </div>
+
+          <div class="presets-bar">
+            <span class="presets-label">Préréglages rapides pour travailler :</span>
+            <div class="presets-buttons">
+              <button type="button" class="btn-chip" data-preset="learn_v1">
+                🎯 Apprendre Voix 1 <small>(Voix 1 forte, autres à 10%)</small>
+              </button>
+              <button type="button" class="btn-chip" data-preset="learn_v2">
+                🎯 Apprendre Voix 2 <small>(Voix 2 forte, autres à 10%)</small>
+              </button>
+              <button type="button" class="btn-chip" data-preset="learn_v3" id="preset-learn-v3" hidden>
+                🎯 Apprendre Voix 3 <small>(Chœur 2 fort, autres à 10%)</small>
+              </button>
+              <button type="button" class="btn-chip" data-preset="split_ears">
+                🎧 Répartir dans les oreilles <small>(Gauche / Centre / Droite)</small>
+              </button>
+              <button type="button" class="btn-chip" data-preset="karaoke_no_v1">
+                🎤 Chanter Voix 1 seul <small>(Voix 1 coupée)</small>
+              </button>
+              <button type="button" class="btn-chip" data-preset="karaoke_no_v2">
+                🎤 Chanter Voix 2 seul <small>(Voix 2 coupée)</small>
+              </button>
+              <button type="button" class="btn-chip" data-preset="karaoke_no_v3" id="preset-karaoke-v3" hidden>
+                🎤 Chanter Voix 3 seul <small>(Chœur 2 coupé)</small>
+              </button>
+              <button type="button" class="btn-chip" data-preset="reset">
+                🔄 Tout à 100%
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Barre de transport, Tempo et Boucle A-B -->
+        <div class="card transport-card">
+          <div class="transport-main">
+            <div class="transport-buttons">
+              <button type="button" id="btn-restart" class="btn-icon" title="Retour au début">⏮</button>
+              <button type="button" id="btn-rw" class="btn-icon" title="Reculer de 5 secondes">-5s</button>
+              <button type="button" id="btn-play" class="btn-play" title="Lecture / Pause (Barre d'espace)">
+                ▶ Lecture
+              </button>
+              <button type="button" id="btn-ff" class="btn-icon" title="Avancer de 5 secondes">+5s</button>
+            </div>
+
+            <div class="time-scrubber">
+              <span class="time-label" id="current-time">0:00</span>
+              <div class="master-seek-wrap">
+                <label for="master-seek" class="sr-only">Position dans le morceau</label>
+                <input type="range" id="master-seek" min="0" max="100" step="0.05" value="0" />
+              </div>
+              <span class="time-label" id="total-time">0:00</span>
+            </div>
+          </div>
+
+          <div class="rehearsal-tools">
+            <!-- Outil Boucle A-B -->
+            <div class="tool-block">
+              <span class="tool-title">🔁 Boucle de travail (A–B) :</span>
+              <div class="loop-controls">
+                <button type="button" id="btn-loop-a" class="btn-tool">Début [A : --:--]</button>
+                <button type="button" id="btn-loop-b" class="btn-tool">Fin [B : --:--]</button>
+                <button type="button" id="btn-loop-toggle" class="btn-tool" disabled>Boucle inactive</button>
+                <button type="button" id="btn-loop-clear" class="btn-tool-clear" title="Effacer la boucle" hidden>✕</button>
+              </div>
+            </div>
+
+            <!-- Outil Vitesse sans changer la hauteur des notes -->
+            <div class="tool-block speed-block">
+              <div class="speed-header">
+                <label for="speed-slider" class="tool-title">🐢 Vitesse (même tonalité) :</label>
+                <strong id="speed-value" class="speed-readout">1.00x</strong>
+              </div>
+              <div class="speed-controls">
+                <div class="speed-Wait-presets">
+                  <button type="button" class="btn-speed" data-speed="0.65">0.65x</button>
+                  <button type="button" class="btn-speed" data-speed="0.8">0.80x</button>
+                  <button type="button" class="btn-speed active" data-speed="1.0">1.0x</button>
+                  <button type="button" class="btn-speed" data-speed="1.15">1.15x</button>
+                </div>
+                <input type="range" id="speed-slider" min="0.5" max="1.25" step="0.05" value="1.0" />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Pistes Multipistes (Voix 1, Voix 2, Musique) -->
+        <div class="tracks-container" id="tracks-container">
+          <!-- Injecté dynamiquement par app.js -->
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js?v=2"></script>
+</body>
+</html>
