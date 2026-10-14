@@ -492,10 +492,17 @@ def split_two_voices_pitch(
     comb_low = np.zeros((max_bin, n_frames), dtype=np.float32)
     comb_high = np.zeros((max_bin, n_frames), dtype=np.float32)
 
-    for k in range(1, 9):
+    # Les 8 premières harmoniques servent au masque de la Voix 2 (inchangé) ;
+    # la Voix 3 suit ses harmoniques jusqu'à 24 pour garder ses formants et sa clarté.
+    for k in range(1, 25):
         bw = 24.0 * (1.0 + 0.1 * k)
         comb_low += (1.0 / (k**0.4)) * np.exp(-0.5 * ((freqs_col - k * f_low[np.newaxis, :]) / bw) ** 2)
         comb_high += (1.0 / (k**0.4)) * np.exp(-0.5 * ((freqs_col - k * f_high[np.newaxis, :]) / bw) ** 2)
+        if k == 8:
+            comb_low_8 = comb_low.copy()
+            comb_high_8 = comb_high.copy()
+    comb_low_full, comb_high_full = comb_low, comb_high
+    comb_low, comb_high = comb_low_8, comb_high_8
 
     reg_high = 1.0 / (1.0 + np.exp(-(freqs_col - split_f * 1.15) / 68.0))
     score_high = comb_high * (0.4 + 0.6 * reg_high) + 0.15 * reg_high
@@ -505,8 +512,17 @@ def split_two_voices_pitch(
     mask_high[:max_bin, :] = (score_high**1.6) / (score_high**1.6 + score_low**1.6 + 1e-8)
     mask_high = scipy.ndimage.gaussian_filter(mask_high, sigma=(1.5, 2.0))
     mask_high = np.clip(mask_high, 0.0, 1.0)
-    # Voix 3 (mask_low) reste 100% identique à la version 949ac66
-    mask_low = 1.0 - mask_high
+    # Voix 3 dé-étouffée (mask_low) : l'a priori « grave = Voix 3 / aigu = Voix 2 » ne s'applique
+    # qu'aux fondamentales (< ~1 kHz). Au-dessus, chaque zone revient à la voix dont les harmoniques
+    # y tombent, et les consonnes / souffle (sans harmonique) sont partagés à parts égales.
+    prior_fade = 1.0 / (1.0 + np.exp((freqs_col - 1000.0) / 250.0))
+    prior_low = (1.0 - reg_high) * prior_fade
+    prior_high = reg_high * prior_fade
+    score_low_3 = comb_low_full * (1.0 + prior_low) + 0.15 * prior_low + 0.05
+    score_high_3 = comb_high_full * (1.0 + prior_high) + 0.15 * prior_high + 0.05
+    mask_low = np.ones((n_bins, n_frames), dtype=np.float32) * 0.5
+    mask_low[:max_bin, :] = (score_low_3**1.6) / (score_low_3**1.6 + score_high_3**1.6 + 1e-8)
+    mask_low = np.clip(scipy.ndimage.gaussian_filter(mask_low, sigma=(1.5, 2.0)), 0.0, 1.0)
 
     # Dé-étouffement de la Voix 2 (mask_high_clear) :
     # - conserve 100% des formants et consonnes (> 1.8 kHz) sans les trous creusés par comb_low
