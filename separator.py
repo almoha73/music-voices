@@ -541,17 +541,17 @@ def split_two_voices_pitch(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Sépare un flux vocal contenant 2 voix simultanées (ex: 2 personnes dans les chœurs ou un duo) en :
-    - Voix Haute (Aiguë / Soprano / Ténor / Harmonie haute)
-    - Voix Basse (Grave / Alto / Baryton / Harmonie basse)
+    - Voix Haute (Aiguë / Soprano / Ténor / Harmonie haute : 265 - 415 Hz)
+    - Voix Basse (Grave / Alto / Baryton / Harmonie basse : 155 - 265 Hz)
     Utilise :
-    1. Un suivi conjoint d'harmonie (F0_low et F0_high contraints aux intervalles musicaux de tierce/quarte/quinte/sixte
-       avec suppression d'octave pour que les 2 voix ne s'échangent jamais).
-    2. Un peigne harmonique haute résolution (16 harmoniques jusqu'à 5.5 kHz) avec inhibition croisée active
-       (net_high = comb_high - 0.65 * comb_low) pour éliminer la diaphonie (ne pas entendre la Voix 2 dans la Voix 3)
-       tout en gardant les harmoniques aigus propres à chaque voix.
+    1. Une détection de vraies fondamentales avec pénalité de sous-harmoniques (f/2 et f/3)
+       pour ne jamais confondre le 2e harmonique de la voix grave (ex: 440 Hz = 2 x 220 Hz)
+       avec la note fondamentale de la voix aiguë (ex: 300-335 Hz).
+    2. Une protection de la bande fondamentale de chaque voix (Voix Basse sous 0.92*F_high,
+       et Voix Haute dans l'intervalle libre entre 1*F_low et 2*F_low) + peigne Wiener équilibré.
     """
     if progress_cb:
-        progress_cb(82, "Séparation harmonique haute isolation Voix Haute / Voix Basse...")
+        progress_cb(82, "Séparation harmonique équilibrée Voix Haute / Voix Basse...")
 
     clean_in = clean_vocal_stem(vocals, sr=sr, is_backing=True)
     orig_len = clean_in.shape[1]
@@ -567,45 +567,43 @@ def split_two_voices_pitch(
     mag = np.hypot(np.abs(Zl), np.abs(Zr)) + 1e-8
     n_bins, n_frames = mag.shape
 
-    # 1. Suivi conjoint des 2 notes fondamentales (F0_low et F0_high) avec anti-collision d'octave
-    cand_mask = (freqs >= 130.0) & (freqs <= 650.0)
+    # 1. Détecteur de vraies fondamentales avec suppression des fantômes d'octave (f/2 et f/3)
+    cand_mask = (freqs >= 145.0) & (freqs <= 430.0)
     cand_idx = np.where(cand_mask)[0]
     cand_hz = freqs[cand_idx]
 
     salience = np.zeros((len(cand_idx), n_frames), dtype=np.float32)
     for k in range(1, 6):
         h_bins = np.minimum(cand_idx * k, n_bins - 1)
-        salience += (1.0 / (k**0.5)) * (mag[h_bins, :] ** 0.7)
-    salience = scipy.ndimage.gaussian_filter(salience, sigma=(0.8, 3.0))
+        salience += (1.0 / (k**0.4)) * (mag[h_bins, :] ** 0.75)
 
-    # Voix Basse (Chœur 2) dans le registre [145 Hz, 330 Hz]
-    lo_sub = (cand_hz >= 145.0) & (cand_hz <= 330.0)
-    lo_cands = np.where(lo_sub)[0]
+    half_idx = np.maximum(1, np.round(cand_idx / 2.0).astype(int))
+    third_idx = np.maximum(1, np.round(cand_idx / 3.0).astype(int))
+    sub_penalty = 1.35 * (mag[half_idx, :] ** 0.75) + 0.70 * (mag[third_idx, :] ** 0.75)
+    f0_score = np.maximum(0.0, salience - sub_penalty)
+    f0_score = scipy.ndimage.gaussian_filter(f0_score, sigma=(1.0, 3.0))
+
+    # Séparation des registres fondamentaux : Voix Basse (155-265 Hz) et Voix Haute (265-415 Hz)
+    lo_mask = (cand_hz >= 155.0) & (cand_hz <= 265.0)
+    hi_mask = (cand_hz > 265.0) & (cand_hz <= 415.0)
     f_low = scipy.ndimage.median_filter(
-        cand_hz[lo_cands[np.argmax(salience[lo_cands, :], axis=0)]], size=15
+        cand_hz[np.where(lo_mask)[0][np.argmax(f0_score[lo_mask, :], axis=0)]], size=15
     )
-
-    # Voix Haute (Chœur 1) dans l'intervalle d'harmonie [1.20 * F_low, 1.82 * F_low] en supprimant l'octave (2 * F_low)
-    ch_grid = cand_hz[:, np.newaxis]
-    fl_grid = f_low[np.newaxis, :]
-    valid_hi = (ch_grid >= fl_grid * 1.20) & (
-        ch_grid <= np.minimum(620.0, fl_grid * 1.82)
+    f_high = scipy.ndimage.median_filter(
+        cand_hz[np.where(hi_mask)[0][np.argmax(f0_score[hi_mask, :], axis=0)]], size=15
     )
-    not_octave = 1.0 - 0.88 * np.exp(-0.5 * ((ch_grid - 2.0 * fl_grid) / 22.0) ** 2)
-    hi_score = np.where(valid_hi, salience * not_octave, 0.0)
-    f_high = scipy.ndimage.median_filter(cand_hz[np.argmax(hi_score, axis=0)], size=15)
-    f_high = np.maximum(f_high, f_low * 1.22)
+    f_high = np.maximum(f_high, f_low * 1.18)
 
-    # 2. Peigne harmonique exclusif sur 16 harmoniques (jusqu'à 5500 Hz) avec inhibition croisée
+    # 2. Peigne harmonique Wiener (jusqu'à 5500 Hz) sans soustraction destructive sur la Voix 2
     max_bin = int(np.searchsorted(freqs, 5500.0))
     freqs_col = freqs[:max_bin, np.newaxis]
     comb_low = np.zeros((max_bin, n_frames), dtype=np.float32)
     comb_high = np.zeros((max_bin, n_frames), dtype=np.float32)
 
     for k in range(1, 17):
-        bw_l = np.sqrt(13.0**2 + (0.015 * k * f_low[np.newaxis, :]) ** 2)
-        bw_h = np.sqrt(13.0**2 + (0.015 * k * f_high[np.newaxis, :]) ** 2)
-        w = 1.0 / (k**0.25)
+        bw_l = np.sqrt(12.0**2 + (0.014 * k * f_low[np.newaxis, :]) ** 2)
+        bw_h = np.sqrt(12.0**2 + (0.014 * k * f_high[np.newaxis, :]) ** 2)
+        w = 1.0 / (k**0.45)
         comb_low += w * np.exp(
             -0.5 * ((freqs_col - k * f_low[np.newaxis, :]) / bw_l) ** 2
         )
@@ -613,43 +611,44 @@ def split_two_voices_pitch(
             -0.5 * ((freqs_col - k * f_high[np.newaxis, :]) / bw_h) ** 2
         )
 
-    # Inhibition croisée : retranche activement les harmoniques de l'autre voix pour éviter tout repisse (bleed)
-    net_high = np.maximum(0.0, comb_high - 0.65 * comb_low)
-    net_low = np.maximum(0.0, comb_low - 0.65 * comb_high)
-
-    # Coupe stricte sous 0.94 * F0_high pour la Voix Haute (impossible physiquement de chanter sous sa fondamentale)
+    # Protection de la fondamentale de chaque voix :
+    # - Sous 0.92 * F_high : 100% Voix Basse
+    # - Autour de F_high (dans le creux entre 1*F_low et 2*F_low) : priorité absolue à la Voix Haute (Voix 2) !
     below_f0_high = 1.0 / (
-        1.0 + np.exp(-(freqs_col - 0.94 * f_high[np.newaxis, :]) / 12.0)
+        1.0 + np.exp(-(freqs_col - 0.92 * f_high[np.newaxis, :]) / 10.0)
     )
-    net_high = net_high * below_f0_high
+    in_f0_high_gap = np.exp(-0.5 * ((freqs_col - f_high[np.newaxis, :]) / 22.0) ** 2)
 
-    mask_h_sub = (net_high**3.0 + 1e-9) / (net_high**3.0 + net_low**3.0 + 2e-9)
-    mask_l_sub = (net_low**3.0 + 1e-9) / (net_high**3.0 + net_low**3.0 + 2e-9)
+    comb_high_adj = comb_high * below_f0_high + 0.65 * in_f0_high_gap
+    comb_low_adj = comb_low * (1.0 - 0.85 * in_f0_high_gap)
 
-    # Atténue les creux inter-harmoniques pour supprimer la réverbe résiduelle et la diaphonie
-    harmonic_presence = np.clip((comb_high + comb_low) / 0.35, 0.12, 1.0)
-    mask_h_sub *= harmonic_presence
-    mask_l_sub *= harmonic_presence
+    mask_h_sub = (comb_high_adj**2.6 + 1e-9) / (
+        comb_high_adj**2.6 + comb_low_adj**2.6 + 2e-9
+    )
+    mask_l_sub = (comb_low_adj**2.6 + 1e-9) / (
+        comb_high_adj**2.6 + comb_low_adj**2.6 + 2e-9
+    )
 
-    mask_high = np.zeros((n_bins, n_frames), dtype=np.float32)
-    mask_low = np.zeros((n_bins, n_frames), dtype=np.float32)
+    harm_env = np.clip((comb_high + comb_low) / 0.25, 0.30, 1.0)
+    mask_h_sub *= harm_env
+    mask_l_sub *= harm_env
+
+    mask_high = np.full((n_bins, n_frames), 0.5, dtype=np.float32)
+    mask_low = np.full((n_bins, n_frames), 0.5, dtype=np.float32)
     mask_high[:max_bin, :] = mask_h_sub
     mask_low[:max_bin, :] = mask_l_sub
-
-    # Au-dessus de 5500 Hz (sibilances pures), attribue à la voix dominante à cet instant
-    dom_h = np.sum(mask_h_sub * mag[:max_bin, :], axis=0, keepdims=True)
-    dom_l = np.sum(mask_l_sub * mag[:max_bin, :], axis=0, keepdims=True)
-    sib_h = (dom_h**2) / (dom_h**2 + dom_l**2 + 1e-8)
-    mask_high[max_bin:, :] = sib_h * 0.75
-    mask_low[max_bin:, :] = (1.0 - sib_h) * 0.75
 
     mask_high = scipy.ndimage.gaussian_filter(mask_high, sigma=(0.6, 1.0))
     mask_low = scipy.ndimage.gaussian_filter(mask_low, sigma=(0.6, 1.0))
 
-    # Restauration de présence sur les propres harmoniques de la Voix Basse (sans mélanger la Voix Haute !)
-    low_clarity = (
-        1.0 + 0.35 * np.exp(-0.5 * ((freqs[:, np.newaxis] - 2400.0) / 1100.0) ** 2)
+    # Renforcement de présence équilibré sur les deux voix
+    high_clarity = (
+        1.0 + 0.25 * np.exp(-0.5 * ((freqs[:, np.newaxis] - 2800.0) / 1200.0) ** 2)
     ).astype(np.float32)
+    low_clarity = (
+        1.0 + 0.25 * np.exp(-0.5 * ((freqs[:, np.newaxis] - 2300.0) / 1100.0) ** 2)
+    ).astype(np.float32)
+    mask_high = mask_high * high_clarity
     mask_low = mask_low * low_clarity
 
     v_high_l = librosa.istft(
@@ -672,7 +671,7 @@ def split_two_voices_pitch(
     env_in = np.mean(np.abs(clean_in), axis=0)
     active = env_in > (float(np.percentile(env_in, 85)) * 0.35 + 1e-6)
     if np.any(active):
-        target_rms = float(np.sqrt(np.mean(clean_in[:, active] ** 2))) * 0.82
+        target_rms = float(np.sqrt(np.mean(clean_in[:, active] ** 2))) * 0.85
         rms_h = float(np.sqrt(np.mean(voice_high[:, active] ** 2))) + 1e-8
         rms_l = float(np.sqrt(np.mean(voice_low[:, active] ** 2))) + 1e-8
         voice_high = voice_high * np.clip(target_rms / rms_h, 0.8, 2.2)
