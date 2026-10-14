@@ -504,10 +504,22 @@ def split_two_voices_pitch(
     mask_high[:max_bin, :] = (score_high**1.6) / (score_high**1.6 + score_low**1.6 + 1e-8)
     mask_high = scipy.ndimage.gaussian_filter(mask_high, sigma=(1.5, 2.0))
     mask_high = np.clip(mask_high, 0.0, 1.0)
+    # Voix 3 (mask_low) reste 100% identique à la version 949ac66
     mask_low = 1.0 - mask_high
 
-    _, v_high_l = scipy.signal.istft(Z_l * mask_high, fs=sr, window=win, nperseg=n_fft, noverlap=n_fft - hop)
-    _, v_high_r = scipy.signal.istft(Z_r * mask_high, fs=sr, window=win, nperseg=n_fft, noverlap=n_fft - hop)
+    # Dé-étouffement de la Voix 2 (mask_high_clear) :
+    # - conserve 100% des formants et consonnes (> 1.8 kHz) sans les trous creusés par comb_low
+    # - relève la clarté vocale (+4 dB entre 2 kHz et 10 kHz) et coupe la boue grave (< 150 Hz)
+    f_col_all = freqs[:, np.newaxis]
+    high_formant_keep = np.clip((f_col_all - 1600.0) / 1400.0, 0.0, 1.0)
+    clarity_lift = (
+        (1.0 - 0.35 * np.exp(-0.5 * ((f_col_all - 180.0) / 80.0) ** 2))
+        * (1.0 + 0.55 * (1.0 / (1.0 + np.exp(-(f_col_all - 2200.0) / 600.0))))
+    ).astype(np.float32)
+    mask_high_clear = np.maximum(mask_high, 0.88 * high_formant_keep) * clarity_lift
+
+    _, v_high_l = scipy.signal.istft(Z_l * mask_high_clear, fs=sr, window=win, nperseg=n_fft, noverlap=n_fft - hop)
+    _, v_high_r = scipy.signal.istft(Z_r * mask_high_clear, fs=sr, window=win, nperseg=n_fft, noverlap=n_fft - hop)
     _, v_low_l = scipy.signal.istft(Z_l * mask_low, fs=sr, window=win, nperseg=n_fft, noverlap=n_fft - hop)
     _, v_low_r = scipy.signal.istft(Z_r * mask_low, fs=sr, window=win, nperseg=n_fft, noverlap=n_fft - hop)
 
@@ -610,7 +622,7 @@ def split_two_voices_stereo(
 
 
 # ============================================================================
-# PIPELINE COMPLET DE TRAITEMENT D'UNE CHANSON (3 OU 4 PISTES)
+# PIPELINE COMPLET DE TRAITEMENT D'UNE CHANSON (3, 4 OU 5 PISTES)
 # ============================================================================
 
 
@@ -622,9 +634,10 @@ def process_song(
     progress_cb: ProgressCallback = None,
 ) -> Dict[str, object]:
     """
-    Découpe un fichier audio en 3 ou 4 pistes :
-    - Mode lead_2choirs (4 pistes) :
+    Découpe un fichier audio :
+    - Mode lead_2choirs :
       * voix_1 : Voix Principale (Lead)
+      * choeurs : Chœurs — Les 2 voix ensemble
       * voix_2 : Chœur 1 — Voix Haute (Aiguë)
       * voix_3 : Chœur 2 — Voix Basse (Grave)
       * musique : Accompagnement instrumental
@@ -664,6 +677,7 @@ def process_song(
     voice_1 = None
     voice_2 = None
     voice_3 = None
+    choir_combined = None
 
     if mode in ("lead_backing", "lead_2choirs"):
         v1_label = "Voix 1 — Voix Principale (Lead)"
@@ -686,6 +700,7 @@ def process_song(
             voice_1, voice_2 = split_lead_and_backing_dsp(vocals, sr=sr, progress_cb=progress_cb)
 
         if mode == "lead_2choirs":
+            choir_combined = voice_2.copy()
             v2_label = "Voix 2 — Chœur 1 (Voix Haute / Aiguë)"
             v3_label = "Voix 3 — Chœur 2 (Voix Basse / Grave)"
             if progress_cb:
@@ -723,8 +738,10 @@ def process_song(
 
     stems_data = [
         ("voix_1", v1_label, "#6366f1", voice_1),
-        ("voix_2", v2_label, "#ec4899", voice_2),
     ]
+    if choir_combined is not None:
+        stems_data.append(("choeurs_combines", "Chœurs — Les 2 voix ensemble", "#a855f7", choir_combined))
+    stems_data.append(("voix_2", v2_label, "#ec4899", voice_2))
     if voice_3 is not None:
         stems_data.append(("voix_3", v3_label, "#f59e0b", voice_3))
     stems_data.append(("musique", "Musique / Accompagnement", "#10b981", instrumental))
@@ -766,18 +783,21 @@ def process_song(
 def split_choir_in_song_dir(song_dir: Path) -> Dict[str, object]:
     """
     Prend un morceau déjà découpé (possédant voix_1, voix_2 [Chœurs], musique)
-    et divise directement la piste voix_2 (Chœurs) en 2 pistes distinctes :
-    - voix_2 : Voix 2 — Chœur 1 (Voix Haute / Aiguë)
+    et conserve la piste Chœurs complète (les 2 voix ensemble) tout en créant :
+    - choeurs_combines : Chœurs — Les 2 voix ensemble
+    - voix_2 : Voix 2 — Chœur 1 (Voix Haute / Aiguë, dé-étouffée)
     - voix_3 : Voix 3 — Chœur 2 (Voix Basse / Grave)
     sans avoir besoin de recalculer l'IA depuis le début !
     """
     import json
+    import time
 
     meta_path = song_dir / "metadata.json"
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
 
     # Sauvegarde une copie de la piste chœurs combinée si pas déjà fait
     choir_combined_wav = song_dir / "choeurs_combines.wav"
+    choir_combined_mp3 = song_dir / "choeurs_combines.mp3"
     v2_wav = song_dir / "voix_2.wav"
     if not choir_combined_wav.exists() and v2_wav.exists():
         shutil.copyfile(v2_wav, choir_combined_wav)
@@ -785,6 +805,11 @@ def split_choir_in_song_dir(song_dir: Path) -> Dict[str, object]:
     source_wav = choir_combined_wav if choir_combined_wav.exists() else v2_wav
     data, sr = sf.read(str(source_wav), dtype="float32", always_2d=True)
     choir_audio = data.T
+
+    # S'assure que le MP3 de la piste Chœurs (les 2 voix ensemble) existe aussi
+    if not choir_combined_mp3.exists():
+        save_audio_files(choir_audio, sr, choir_combined_wav, choir_combined_mp3)
+    peaks_choir = compute_waveform_peaks(choir_audio, num_points=360)
 
     choir_high, choir_low = split_two_voices_pitch(choir_audio, sr=sr)
 
@@ -802,7 +827,19 @@ def split_choir_in_song_dir(song_dir: Path) -> Dict[str, object]:
     for st in meta["stems"]:
         if st["id"] == "voix_1":
             new_stems.append(st)
+        elif st["id"] == "choeurs_combines":
+            continue
         elif st["id"] == "voix_2":
+            new_stems.append(
+                {
+                    "id": "choeurs_combines",
+                    "label": "Chœurs — Les 2 voix ensemble",
+                    "color": "#a855f7",
+                    "wav_file": "choeurs_combines.wav",
+                    "mp3_file": "choeurs_combines.mp3",
+                    "peaks": peaks_choir,
+                }
+            )
             new_stems.append(
                 {
                     "id": "voix_2",
@@ -829,8 +866,6 @@ def split_choir_in_song_dir(song_dir: Path) -> Dict[str, object]:
             new_stems.append(st)
 
     meta["mode"] = "lead_2choirs"
-    import time
-
     meta["version"] = int(time.time())
     meta["stems"] = new_stems
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")

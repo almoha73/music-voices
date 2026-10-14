@@ -4,7 +4,7 @@
 
 const MODE_DESCRIPTIONS = {
   lead_2choirs:
-    "Idéal quand il y a un chanteur principal + 2 personnes qui chantent les chœurs en harmonie (ex: Wagon Wheel) : crée 4 pistes !",
+    "Idéal quand il y a un chanteur principal + 2 personnes qui chantent les chœurs en harmonie (ex: Wagon Wheel) : crée la piste Chœurs (les 2 voix) + Chœur 1 + Chœur 2 !",
   lead_backing:
     "Idéal pour séparer le chanteur principal (Voix 1), les harmonies/chœurs groupés (Voix 2) et la musique.",
   duet_pitch:
@@ -14,7 +14,7 @@ const MODE_DESCRIPTIONS = {
 };
 
 const MODE_BADGES = {
-  lead_2choirs: "Mode Lead + 2 Chœurs (4 pistes)",
+  lead_2choirs: "Mode Lead + Chœurs (2 voix + séparées)",
   lead_backing: "Mode Lead & Chœurs",
   duet_pitch: "Mode Duo Harmonisé (Haute / Basse)",
   duet_stereo: "Mode Duo Spatial (Gauche / Droite)",
@@ -311,12 +311,15 @@ function selectSong(song) {
   document.getElementById("current-time").textContent = "0:00";
 
   const hasVoix3 = (song.stems || []).some((s) => s.id === "voix_3");
+  const hasChoirCombined = (song.stems || []).some((s) => s.id === "choeurs_combines");
   const btnSplitChoir = document.getElementById("btn-split-choir");
   if (btnSplitChoir) {
     btnSplitChoir.hidden = hasVoix3;
   }
+  const presetLearnChoir = document.getElementById("preset-learn-choir");
   const presetLearnV3 = document.getElementById("preset-learn-v3");
   const presetKaraokeV3 = document.getElementById("preset-karaoke-v3");
+  if (presetLearnChoir) presetLearnChoir.hidden = !hasChoirCombined;
   if (presetLearnV3) presetLearnV3.hidden = !hasVoix3;
   if (presetKaraokeV3) presetKaraokeV3.hidden = !hasVoix3;
 
@@ -347,6 +350,7 @@ function buildTracksUI(song) {
   container.innerHTML = "";
 
   const ver = song.version || song.created_at || 1;
+  const hasSeparateChoirs = (song.stems || []).some((s) => s.id === "voix_3");
   for (const stem of song.stems) {
     const wavUrl = `/library/${song.id}/${stem.wav_file}?v=${encodeURIComponent(ver)}`;
     const mp3Url = `/library/${song.id}/${stem.mp3_file}?v=${encodeURIComponent(ver)}`;
@@ -410,6 +414,10 @@ function buildTracksUI(song) {
     attachSliderSync(panSlider, "#94a3b8");
 
     const canvas = card.querySelector(`#canvas-${stem.id}`);
+    const initialMuted = stem.id === "choeurs_combines" && hasSeparateChoirs;
+    if (initialMuted) {
+      card.querySelector(".btn-ms.mute").classList.add("active");
+    }
 
     trackNodes[stem.id] = {
       id: stem.id,
@@ -419,7 +427,7 @@ function buildTracksUI(song) {
       panNode: null,
       volume: 1.0,
       pan: 0.0,
-      muted: false,
+      muted: initialMuted,
       solo: false,
       peaks: stem.peaks || [],
       color: stem.color,
@@ -503,6 +511,7 @@ function buildTracksUI(song) {
     });
   }
 
+  updateAudioGains();
   requestAnimationFrame(() => drawAllWaveforms(0));
 }
 
@@ -750,18 +759,28 @@ function applyPreset(presetName) {
   const configs = {
     learn_v1: {
       voix_1: { vol: 125, pan: 0, mute: false, solo: false },
+      choeurs_combines: { vol: 100, pan: 0, mute: true, solo: false },
       voix_2: { vol: 10, pan: 0, mute: false, solo: false },
       voix_3: { vol: 10, pan: 0, mute: false, solo: false },
       musique: { vol: 65, pan: 0, mute: false, solo: false },
     },
+    learn_choir: {
+      voix_1: { vol: 10, pan: 0, mute: false, solo: false },
+      choeurs_combines: { vol: 125, pan: 0, mute: false, solo: false },
+      voix_2: { vol: 100, pan: 0, mute: true, solo: false },
+      voix_3: { vol: 100, pan: 0, mute: true, solo: false },
+      musique: { vol: 65, pan: 0, mute: false, solo: false },
+    },
     learn_v2: {
       voix_1: { vol: 10, pan: 0, mute: false, solo: false },
+      choeurs_combines: { vol: 100, pan: 0, mute: true, solo: false },
       voix_2: { vol: 125, pan: 0, mute: false, solo: false },
       voix_3: { vol: 10, pan: 0, mute: false, solo: false },
       musique: { vol: 65, pan: 0, mute: false, solo: false },
     },
     learn_v3: {
       voix_1: { vol: 10, pan: 0, mute: false, solo: false },
+      choeurs_combines: { vol: 100, pan: 0, mute: true, solo: false },
       voix_2: { vol: 10, pan: 0, mute: false, solo: false },
       voix_3: { vol: 125, pan: 0, mute: false, solo: false },
       musique: { vol: 65, pan: 0, mute: false, solo: false },
@@ -769,6 +788,7 @@ function applyPreset(presetName) {
     split_ears: hasV3
       ? {
           voix_1: { vol: 100, pan: 0, mute: false, solo: false },
+          choeurs_combines: { vol: 100, pan: 0, mute: true, solo: false },
           voix_2: { vol: 115, pan: -0.85, mute: false, solo: false },
           voix_3: { vol: 115, pan: 0.85, mute: false, solo: false },
           musique: { vol: 60, pan: 0, mute: false, solo: false },
@@ -780,24 +800,28 @@ function applyPreset(presetName) {
         },
     karaoke_no_v1: {
       voix_1: { vol: 0, pan: 0, mute: true, solo: false },
+      choeurs_combines: { vol: 100, pan: 0, mute: true, solo: false },
       voix_2: { vol: 100, pan: 0, mute: false, solo: false },
       voix_3: { vol: 100, pan: 0, mute: false, solo: false },
       musique: { vol: 100, pan: 0, mute: false, solo: false },
     },
     karaoke_no_v2: {
       voix_1: { vol: 100, pan: 0, mute: false, solo: false },
+      choeurs_combines: { vol: 100, pan: 0, mute: true, solo: false },
       voix_2: { vol: 0, pan: 0, mute: true, solo: false },
       voix_3: { vol: 100, pan: 0, mute: false, solo: false },
       musique: { vol: 100, pan: 0, mute: false, solo: false },
     },
     karaoke_no_v3: {
       voix_1: { vol: 100, pan: 0, mute: false, solo: false },
+      choeurs_combines: { vol: 100, pan: 0, mute: true, solo: false },
       voix_2: { vol: 100, pan: 0, mute: false, solo: false },
       voix_3: { vol: 0, pan: 0, mute: true, solo: false },
       musique: { vol: 100, pan: 0, mute: false, solo: false },
     },
     reset: {
       voix_1: { vol: 100, pan: 0, mute: false, solo: false },
+      choeurs_combines: { vol: 100, pan: 0, mute: hasV3, solo: false },
       voix_2: { vol: 100, pan: 0, mute: false, solo: false },
       voix_3: { vol: 100, pan: 0, mute: false, solo: false },
       musique: { vol: 100, pan: 0, mute: false, solo: false },
