@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Callable, Dict, Optional, Tuple
 
@@ -112,7 +113,7 @@ def decode_audio_to_stereo(input_path: Path, sr: int = 44100) -> Tuple[np.ndarra
     Convertit n'importe quel fichier audio (MP3, WAV, M4A, OGG, FLAC)
     en signal stéréo float32 (shape: [2, N]) à 44100 Hz via FFmpeg.
     """
-    tmp_wav = input_path.parent / f"_tmp_decode_{os.getpid()}.wav"
+    tmp_wav = input_path.parent / f"_tmp_decode_{uuid.uuid4().hex}.wav"
     tmp_wav.parent.mkdir(parents=True, exist_ok=True)
     try:
         cmd = [

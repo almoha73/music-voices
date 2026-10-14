@@ -5,6 +5,7 @@ Serveur Web local pour Atelier Voix — Application de séparation vocale et d'e
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import threading
 import time
@@ -40,6 +41,19 @@ app = FastAPI(title="Atelier Voix — Séparation Vocale & Studio de Chant")
 
 # Suivi en mémoire des tâches de découpage en cours
 JOBS: Dict[str, Dict[str, object]] = {}
+
+# Une seule séparation à la fois : l'IA utilise déjà tous les cœurs du processeur,
+# les tâches suivantes attendent leur tour.
+SEPARATION_LOCK = threading.Lock()
+
+SONG_ID_RE = re.compile(r"^[0-9a-f]{10}$")
+
+
+def get_song_dir(song_id: str) -> Path:
+    """Renvoie le dossier d'un morceau après validation de son identifiant."""
+    if not SONG_ID_RE.match(song_id):
+        raise HTTPException(status_code=400, detail="Identifiant de morceau invalide.")
+    return LIBRARY_DIR / song_id
 
 
 class CustomMixRequest(BaseModel):
@@ -80,13 +94,19 @@ def run_separation_job(
         JOBS[job_id]["message"] = msg
 
     try:
-        result = process_song(
-            input_file=input_path,
-            output_dir=song_dir,
-            mode=mode,
-            engine=engine,
-            progress_cb=update_progress,
-        )
+        if not SEPARATION_LOCK.acquire(blocking=False):
+            update_progress(2, "En attente : un autre morceau est en cours de découpage...")
+            SEPARATION_LOCK.acquire()
+        try:
+            result = process_song(
+                input_file=input_path,
+                output_dir=song_dir,
+                mode=mode,
+                engine=engine,
+                progress_cb=update_progress,
+            )
+        finally:
+            SEPARATION_LOCK.release()
         metadata = {
             "id": song_id,
             "title": title,
@@ -197,7 +217,7 @@ def api_job_status(job_id: str) -> Dict[str, object]:
 
 @app.delete("/api/songs/{song_id}")
 def api_delete_song(song_id: str) -> Dict[str, object]:
-    song_dir = LIBRARY_DIR / song_id
+    song_dir = get_song_dir(song_id)
     if song_dir.exists() and song_dir.is_dir():
         shutil.rmtree(song_dir)
     return {"ok": True}
@@ -210,7 +230,7 @@ def api_split_song_choir(song_id: str) -> Dict[str, object]:
     Voix 2 (Chœur 1 — Voix Haute / Aiguë) et Voix 3 (Chœur 2 — Voix Basse / Grave),
     sans avoir besoin de relancer les 10 minutes d'IA !
     """
-    song_dir = LIBRARY_DIR / song_id
+    song_dir = get_song_dir(song_id)
     if not (song_dir / "metadata.json").exists():
         raise HTTPException(status_code=404, detail="Morceau introuvable.")
     try:
@@ -228,7 +248,7 @@ def api_export_custom_mix(song_id: str, req: CustomMixRequest) -> FileResponse:
     de la table de mixage de l'utilisateur (volumes + panoramique gauche/droite).
     Idéal pour s'exporter un MP3 d'entraînement personnalisé !
     """
-    song_dir = LIBRARY_DIR / song_id
+    song_dir = get_song_dir(song_id)
     meta_path = song_dir / "metadata.json"
     if not meta_path.exists():
         raise HTTPException(status_code=404, detail="Morceau introuvable.")
@@ -250,12 +270,20 @@ def api_export_custom_mix(song_id: str, req: CustomMixRequest) -> FileResponse:
         vol = float(req.volumes.get(stem_id, 1.0))
         pan = float(req.pans.get(stem_id, 0.0))  # -1 (Gauche) à +1 (Droite)
 
-        # Loi de panoramique à puissance constante
-        angle = (pan + 1.0) * (np.pi / 4.0)
-        gain_l = np.cos(angle) * np.sqrt(2.0) / 2.0 * 1.414
-        gain_r = np.sin(angle) * np.sqrt(2.0) / 2.0 * 1.414
+        # Même algorithme que le StereoPannerNode du navigateur (entrée stéréo),
+        # pour que l'export sonne exactement comme l'écoute dans le studio.
+        pan = min(1.0, max(-1.0, pan))
+        x = pan + 1.0 if pan <= 0.0 else pan
+        gain_l = np.cos(x * np.pi / 2.0)
+        gain_r = np.sin(x * np.pi / 2.0)
+        if pan <= 0.0:
+            out_l = audio[0] + audio[1] * gain_l
+            out_r = audio[1] * gain_r
+        else:
+            out_l = audio[0] * gain_l
+            out_r = audio[1] + audio[0] * gain_r
 
-        styled = np.stack([audio[0] * vol * gain_l, audio[1] * vol * gain_r], axis=0)
+        styled = np.stack([out_l * vol, out_r * vol], axis=0)
         if mix_audio is None:
             mix_audio = styled
         else:
