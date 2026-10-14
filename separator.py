@@ -438,246 +438,82 @@ def isolate_vocals_dsp(
     return vocals, instrumental
 
 
-def clean_vocal_stem(
-    vocals: np.ndarray,
-    sr: int = 44100,
-    is_backing: bool = False,
-) -> np.ndarray:
-    """
-    Nettoie une piste vocale séparée pour corriger les 2 défauts typiques de séparation :
-    1. Supprime l'effet « d'écho / réverbe de pièce » (De-Reverb spectral sur la queue de résonance
-       + réduction des échos fantômes entre les phrases).
-    2. Supprime l'effet « étouffé » (coupe-bas à 85 Hz, dé-boue à 230 Hz, et restauration de
-       la présence vocale / diction entre 2.2 kHz et 8 kHz).
-    """
-    orig_len = vocals.shape[1]
-    if orig_len < 2048:
-        return vocals.astype(np.float32)
-
-    # 1. Filtre coupe-bas à 85 Hz (enlève le grondement sourd qui étouffe la voix)
-    sos_hp = scipy.signal.butter(4, 85.0, btype="highpass", fs=sr, output="sos")
-    cleaned = scipy.signal.sosfiltfilt(sos_hp, vocals, axis=1).astype(np.float32)
-
-    # 2. De-Reverb spectral & suppression de l'écho (fenêtre courte 2048 = 46 ms, sans pré-écho)
-    n_fft = 2048
-    hop = 512
-    stft_win = np.hanning(n_fft + 1)[:-1].astype(np.float32)
-
-    Zl = librosa.stft(cleaned[0], n_fft=n_fft, hop_length=hop, window=stft_win, center=True)
-    Zr = librosa.stft(cleaned[1], n_fft=n_fft, hop_length=hop, window=stft_win, center=True)
-    freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
-
-    power = 0.5 * (np.abs(Zl) ** 2 + np.abs(Zr) ** 2) + 1e-10
-
-    # Estimation de la queue de réverbération/écho tardif (décalée de 3 trames ~35 ms)
-    alpha = 0.86 if is_backing else 0.82
-    reverb_est = scipy.signal.lfilter([1.0 - alpha], [1.0, -alpha], power, axis=1)
-    reverb_delayed = np.pad(reverb_est[:, :-3], ((0, 0), (3, 0)), mode="edge")
-
-    # Soustraction spectrale douce de la queue d'écho
-    reverb_weight = 0.48 if is_backing else 0.32
-    dereverb_gain = np.clip(
-        (power - reverb_weight * reverb_delayed) / power,
-        0.22 if is_backing else 0.35,
-        1.0,
-    )
-
-    # Réduction de la réverbe stéréo diffuse (Side > Mid dans les queues de notes)
-    mid = 0.5 * (Zl + Zr)
-    side = 0.5 * (Zl - Zr)
-    side_damp = 0.72 if is_backing else 0.60
-    Zl_dry = mid + side_damp * side
-    Zr_dry = mid - side_damp * side
-
-    # Porte d'activité douce (évite d'entendre l'écho lointain du chanteur principal quand les chœurs se taisent)
-    frame_rms = np.sqrt(np.mean(power[(freqs >= 130.0) & (freqs <= 4500.0), :], axis=0))
-    peak_rms = float(np.percentile(frame_rms, 95)) + 1e-8
-    if is_backing:
-        gate = np.clip((frame_rms - 0.045 * peak_rms) / (0.12 * peak_rms), 0.05, 1.0)
-    else:
-        gate = np.clip((frame_rms - 0.025 * peak_rms) / (0.08 * peak_rms), 0.10, 1.0)
-    gate = scipy.ndimage.gaussian_filter1d(gate.astype(np.float32), sigma=2.5)[np.newaxis, :]
-
-    # Courbe d'égalisation de clarté vocale (anti-effet étouffé) :
-    # - légère atténuation de l'effet "boîte/sourd" autour de 220 Hz
-    # - restauration de la présence (2.5 - 5.5 kHz) et de la diction/air (6 - 10 kHz)
-    f_col = freqs[:, np.newaxis]
-    mud_cut = 1.0 - 0.16 * np.exp(-0.5 * ((f_col - 230.0) / 90.0) ** 2)
-    presence_boost = 1.0 + 0.32 * np.exp(-0.5 * ((f_col - 3400.0) / 1400.0) ** 2)
-    air_boost = 1.0 + 0.20 * np.exp(-0.5 * ((f_col - 7500.0) / 2500.0) ** 2)
-    eq_curve = (mud_cut * presence_boost * air_boost).astype(np.float32)
-
-    total_mask = (
-        scipy.ndimage.gaussian_filter(dereverb_gain.astype(np.float32), sigma=(1.0, 1.2))
-        * gate
-        * eq_curve
-    )
-
-    out_l = librosa.istft(
-        Zl_dry * total_mask, hop_length=hop, window=stft_win, center=True, length=orig_len
-    )
-    out_r = librosa.istft(
-        Zr_dry * total_mask, hop_length=hop, window=stft_win, center=True, length=orig_len
-    )
-    out = np.stack([out_l, out_r], axis=0).astype(np.float32)
-
-    # Conserve le niveau sonore des passages chantés (compense l'énergie de réverbe retirée)
-    in_env = np.mean(np.abs(cleaned), axis=0)
-    active = in_env > (float(np.percentile(in_env, 85)) * 0.35 + 1e-6)
-    if np.any(active):
-        rms_in = float(np.sqrt(np.mean(cleaned[:, active] ** 2)))
-        rms_out = float(np.sqrt(np.mean(out[:, active] ** 2))) + 1e-8
-        gain_comp = np.clip(rms_in / rms_out, 1.0, 1.85)
-        out = out * gain_comp
-
-    peak = float(np.max(np.abs(out)))
-    if peak > 0.98:
-        out = out * (0.98 / peak)
-    return out
-
-
 def split_two_voices_pitch(
     vocals: np.ndarray, sr: int = 44100, progress_cb: ProgressCallback = None
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Sépare un flux vocal contenant 2 voix simultanées (ex: 2 personnes dans les chœurs ou un duo) en :
-    - Voix Haute (Aiguë / Soprano / Ténor / Harmonie haute : 265 - 415 Hz)
-    - Voix Basse (Grave / Alto / Baryton / Harmonie basse : 155 - 265 Hz)
-    Utilise :
-    1. Une détection de vraies fondamentales avec pénalité de sous-harmoniques (f/2 et f/3)
-       pour ne jamais confondre le 2e harmonique de la voix grave (ex: 440 Hz = 2 x 220 Hz)
-       avec la note fondamentale de la voix aiguë (ex: 300-335 Hz).
-    2. Une protection de la bande fondamentale de chaque voix (Voix Basse sous 0.92*F_high,
-       et Voix Haute dans l'intervalle libre entre 1*F_low et 2*F_low) + peigne Wiener équilibré.
+    - Voix Haute (Aiguë / Soprano / Ténor / Harmonie haute)
+    - Voix Basse (Grave / Alto / Baryton / Harmonie basse)
+    Utilise un suivi dynamique vectorisé des fondamentales (F0) et un peigne harmonique doux (Wiener).
     """
     if progress_cb:
-        progress_cb(82, "Séparation harmonique équilibrée Voix Haute / Voix Basse...")
-
-    clean_in = clean_vocal_stem(vocals, sr=sr, is_backing=True)
-    orig_len = clean_in.shape[1]
+        progress_cb(82, "Séparation harmonique Voix Haute / Voix Basse...")
 
     n_fft = 4096
-    hop = 512
-    stft_win = np.hanning(n_fft + 1)[:-1].astype(np.float32)
+    hop = 1024
+    win = scipy.signal.windows.hann(n_fft, sym=False)
+    orig_len = vocals.shape[1]
 
-    Zl = librosa.stft(clean_in[0], n_fft=n_fft, hop_length=hop, window=stft_win, center=True)
-    Zr = librosa.stft(clean_in[1], n_fft=n_fft, hop_length=hop, window=stft_win, center=True)
-    freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+    freqs, _, Z_l = scipy.signal.stft(
+        vocals[0], fs=sr, window=win, nperseg=n_fft, noverlap=n_fft - hop
+    )
+    _, _, Z_r = scipy.signal.stft(
+        vocals[1], fs=sr, window=win, nperseg=n_fft, noverlap=n_fft - hop
+    )
 
-    mag = np.hypot(np.abs(Zl), np.abs(Zr)) + 1e-8
+    mag = np.hypot(np.abs(Z_l), np.abs(Z_r)) + 1e-8
     n_bins, n_frames = mag.shape
 
-    # 1. Détecteur de vraies fondamentales avec suppression des fantômes d'octave (f/2 et f/3)
-    cand_mask = (freqs >= 145.0) & (freqs <= 430.0)
-    cand_idx = np.where(cand_mask)[0]
-    cand_hz = freqs[cand_idx]
+    f0_mask = (freqs >= 100.0) & (freqs <= 850.0)
+    f0_idx = np.where(f0_mask)[0]
+    f0_freqs = freqs[f0_idx]
 
-    salience = np.zeros((len(cand_idx), n_frames), dtype=np.float32)
-    for k in range(1, 6):
-        h_bins = np.minimum(cand_idx * k, n_bins - 1)
-        salience += (1.0 / (k**0.4)) * (mag[h_bins, :] ** 0.75)
+    hps = mag[f0_idx, :].copy()
+    for harm in (2, 3):
+        harm_idx = np.minimum(f0_idx * harm, n_bins - 1)
+        hps *= (mag[harm_idx, :] ** 0.5)
 
-    half_idx = np.maximum(1, np.round(cand_idx / 2.0).astype(int))
-    third_idx = np.maximum(1, np.round(cand_idx / 3.0).astype(int))
-    sub_penalty = 1.35 * (mag[half_idx, :] ** 0.75) + 0.70 * (mag[third_idx, :] ** 0.75)
-    f0_score = np.maximum(0.0, salience - sub_penalty)
-    f0_score = scipy.ndimage.gaussian_filter(f0_score, sigma=(1.0, 3.0))
+    centroid = np.sum(f0_freqs[:, np.newaxis] * hps, axis=0) / (np.sum(hps, axis=0) + 1e-8)
+    centroid = scipy.ndimage.median_filter(centroid, size=25)
+    split_f = np.clip(centroid, 230.0, 440.0)[np.newaxis, :]
 
-    # Séparation des registres fondamentaux : Voix Basse (155-265 Hz) et Voix Haute (265-415 Hz)
-    lo_mask = (cand_hz >= 155.0) & (cand_hz <= 265.0)
-    hi_mask = (cand_hz > 265.0) & (cand_hz <= 415.0)
-    f_low = scipy.ndimage.median_filter(
-        cand_hz[np.where(lo_mask)[0][np.argmax(f0_score[lo_mask, :], axis=0)]], size=15
-    )
-    f_high = scipy.ndimage.median_filter(
-        cand_hz[np.where(hi_mask)[0][np.argmax(f0_score[hi_mask, :], axis=0)]], size=15
-    )
-    f_high = np.maximum(f_high, f_low * 1.18)
+    f_grid = f0_freqs[:, np.newaxis]
+    low_hps = np.where(f_grid < split_f, hps, 0.0)
+    high_hps = np.where(f_grid >= split_f, hps, 0.0)
 
-    # 2. Peigne harmonique Wiener (jusqu'à 5500 Hz) sans soustraction destructive sur la Voix 2
-    max_bin = int(np.searchsorted(freqs, 5500.0))
+    f_low = scipy.ndimage.median_filter(f0_freqs[np.argmax(low_hps, axis=0)], size=9)
+    f_high = scipy.ndimage.median_filter(f0_freqs[np.argmax(high_hps, axis=0)], size=9)
+
+    # Limite le calcul du peigne aux fréquences vocales utiles (< 10 kHz) pour aller 3x plus vite
+    max_bin = int(np.searchsorted(freqs, 10000.0))
     freqs_col = freqs[:max_bin, np.newaxis]
     comb_low = np.zeros((max_bin, n_frames), dtype=np.float32)
     comb_high = np.zeros((max_bin, n_frames), dtype=np.float32)
 
-    for k in range(1, 17):
-        bw_l = np.sqrt(12.0**2 + (0.014 * k * f_low[np.newaxis, :]) ** 2)
-        bw_h = np.sqrt(12.0**2 + (0.014 * k * f_high[np.newaxis, :]) ** 2)
-        w = 1.0 / (k**0.45)
-        comb_low += w * np.exp(
-            -0.5 * ((freqs_col - k * f_low[np.newaxis, :]) / bw_l) ** 2
-        )
-        comb_high += w * np.exp(
-            -0.5 * ((freqs_col - k * f_high[np.newaxis, :]) / bw_h) ** 2
-        )
+    for k in range(1, 9):
+        bw = 24.0 * (1.0 + 0.1 * k)
+        comb_low += (1.0 / (k**0.4)) * np.exp(-0.5 * ((freqs_col - k * f_low[np.newaxis, :]) / bw) ** 2)
+        comb_high += (1.0 / (k**0.4)) * np.exp(-0.5 * ((freqs_col - k * f_high[np.newaxis, :]) / bw) ** 2)
 
-    # Protection de la fondamentale de chaque voix :
-    # - Sous 0.92 * F_high : 100% Voix Basse
-    # - Autour de F_high (dans le creux entre 1*F_low et 2*F_low) : priorité absolue à la Voix Haute (Voix 2) !
-    below_f0_high = 1.0 / (
-        1.0 + np.exp(-(freqs_col - 0.92 * f_high[np.newaxis, :]) / 10.0)
-    )
-    in_f0_high_gap = np.exp(-0.5 * ((freqs_col - f_high[np.newaxis, :]) / 22.0) ** 2)
+    reg_high = 1.0 / (1.0 + np.exp(-(freqs_col - split_f * 1.15) / 68.0))
+    score_high = comb_high * (0.4 + 0.6 * reg_high) + 0.15 * reg_high
+    score_low = comb_low * (0.4 + 0.6 * (1.0 - reg_high)) + 0.15 * (1.0 - reg_high)
 
-    comb_high_adj = comb_high * below_f0_high + 0.65 * in_f0_high_gap
-    comb_low_adj = comb_low * (1.0 - 0.85 * in_f0_high_gap)
+    mask_high = np.ones((n_bins, n_frames), dtype=np.float32) * 0.65
+    mask_high[:max_bin, :] = (score_high**1.6) / (score_high**1.6 + score_low**1.6 + 1e-8)
+    mask_high = scipy.ndimage.gaussian_filter(mask_high, sigma=(1.5, 2.0))
+    mask_high = np.clip(mask_high, 0.0, 1.0)
+    mask_low = 1.0 - mask_high
 
-    mask_h_sub = (comb_high_adj**2.6 + 1e-9) / (
-        comb_high_adj**2.6 + comb_low_adj**2.6 + 2e-9
-    )
-    mask_l_sub = (comb_low_adj**2.6 + 1e-9) / (
-        comb_high_adj**2.6 + comb_low_adj**2.6 + 2e-9
-    )
+    _, v_high_l = scipy.signal.istft(Z_l * mask_high, fs=sr, window=win, nperseg=n_fft, noverlap=n_fft - hop)
+    _, v_high_r = scipy.signal.istft(Z_r * mask_high, fs=sr, window=win, nperseg=n_fft, noverlap=n_fft - hop)
+    _, v_low_l = scipy.signal.istft(Z_l * mask_low, fs=sr, window=win, nperseg=n_fft, noverlap=n_fft - hop)
+    _, v_low_r = scipy.signal.istft(Z_r * mask_low, fs=sr, window=win, nperseg=n_fft, noverlap=n_fft - hop)
 
-    harm_env = np.clip((comb_high + comb_low) / 0.25, 0.30, 1.0)
-    mask_h_sub *= harm_env
-    mask_l_sub *= harm_env
-
-    mask_high = np.full((n_bins, n_frames), 0.5, dtype=np.float32)
-    mask_low = np.full((n_bins, n_frames), 0.5, dtype=np.float32)
-    mask_high[:max_bin, :] = mask_h_sub
-    mask_low[:max_bin, :] = mask_l_sub
-
-    mask_high = scipy.ndimage.gaussian_filter(mask_high, sigma=(0.6, 1.0))
-    mask_low = scipy.ndimage.gaussian_filter(mask_low, sigma=(0.6, 1.0))
-
-    # Renforcement de présence équilibré sur les deux voix
-    high_clarity = (
-        1.0 + 0.25 * np.exp(-0.5 * ((freqs[:, np.newaxis] - 2800.0) / 1200.0) ** 2)
-    ).astype(np.float32)
-    low_clarity = (
-        1.0 + 0.25 * np.exp(-0.5 * ((freqs[:, np.newaxis] - 2300.0) / 1100.0) ** 2)
-    ).astype(np.float32)
-    mask_high = mask_high * high_clarity
-    mask_low = mask_low * low_clarity
-
-    v_high_l = librosa.istft(
-        Zl * mask_high, hop_length=hop, window=stft_win, center=True, length=orig_len
-    )
-    v_high_r = librosa.istft(
-        Zr * mask_high, hop_length=hop, window=stft_win, center=True, length=orig_len
-    )
-    v_low_l = librosa.istft(
-        Zl * mask_low, hop_length=hop, window=stft_win, center=True, length=orig_len
-    )
-    v_low_r = librosa.istft(
-        Zr * mask_low, hop_length=hop, window=stft_win, center=True, length=orig_len
-    )
-
-    voice_high = np.stack([v_high_l, v_high_r], axis=0).astype(np.float32)
-    voice_low = np.stack([v_low_l, v_low_r], axis=0).astype(np.float32)
-
-    # Équilibrage automatique du volume entre Chœur 1 (Haute) et Chœur 2 (Basse)
-    env_in = np.mean(np.abs(clean_in), axis=0)
-    active = env_in > (float(np.percentile(env_in, 85)) * 0.35 + 1e-6)
-    if np.any(active):
-        target_rms = float(np.sqrt(np.mean(clean_in[:, active] ** 2))) * 0.85
-        rms_h = float(np.sqrt(np.mean(voice_high[:, active] ** 2))) + 1e-8
-        rms_l = float(np.sqrt(np.mean(voice_low[:, active] ** 2))) + 1e-8
-        voice_high = voice_high * np.clip(target_rms / rms_h, 0.8, 2.2)
-        voice_low = voice_low * np.clip(target_rms / rms_l, 0.8, 2.2)
-
-    return voice_high.astype(np.float32), voice_low.astype(np.float32)
+    voice_high = np.stack([v_high_l[:orig_len], v_high_r[:orig_len]], axis=0).astype(np.float32)
+    voice_low = np.stack([v_low_l[:orig_len], v_low_r[:orig_len]], axis=0).astype(np.float32)
+    return voice_high, voice_low
 
 
 def split_lead_and_backing_dsp(
@@ -849,16 +685,12 @@ def process_song(
         if voice_1 is None or voice_2 is None:
             voice_1, voice_2 = split_lead_and_backing_dsp(vocals, sr=sr, progress_cb=progress_cb)
 
-        voice_1 = clean_vocal_stem(voice_1, sr=sr, is_backing=False)
-
         if mode == "lead_2choirs":
             v2_label = "Voix 2 — Chœur 1 (Voix Haute / Aiguë)"
             v3_label = "Voix 3 — Chœur 2 (Voix Basse / Grave)"
             if progress_cb:
                 progress_cb(84, "Étape 3 : Division des Chœurs en 2 voix (Chœur Haute / Chœur Basse)...")
             voice_2, voice_3 = split_two_voices_pitch(voice_2, sr=sr, progress_cb=None)
-        else:
-            voice_2 = clean_vocal_stem(voice_2, sr=sr, is_backing=True)
 
     elif mode == "duet_pitch":
         v1_label = "Voix 1 — Voix Haute / Principale"
@@ -877,7 +709,7 @@ def process_song(
                 lead_ai = vocals - backing_pred
                 v_high, v_low = split_two_voices_pitch(lead_ai, sr=sr, progress_cb=progress_cb)
                 voice_1 = v_high
-                voice_2 = clean_vocal_stem(v_low + backing_pred, sr=sr, is_backing=True)
+                voice_2 = v_low + backing_pred
         if voice_1 is None or voice_2 is None:
             voice_1, voice_2 = split_two_voices_pitch(vocals, sr=sr, progress_cb=progress_cb)
 
@@ -885,8 +717,6 @@ def process_song(
         v1_label = "Voix 1 — Voix A (Gauche / Centre)"
         v2_label = "Voix 2 — Voix B (Droite / Côtés)"
         voice_1, voice_2 = split_two_voices_stereo(vocals, sr=sr, progress_cb=progress_cb)
-        voice_1 = clean_vocal_stem(voice_1, sr=sr, is_backing=False)
-        voice_2 = clean_vocal_stem(voice_2, sr=sr, is_backing=True)
 
     if progress_cb:
         progress_cb(90, "Encodage des pistes séparées en MP3 et WAV...")
@@ -936,34 +766,17 @@ def process_song(
 def split_choir_in_song_dir(song_dir: Path) -> Dict[str, object]:
     """
     Prend un morceau déjà découpé (possédant voix_1, voix_2 [Chœurs], musique)
-    et :
-    1. Nettoie la Voix 1 (anti-écho & clarté vocale)
-    2. Divise la piste Chœurs en 2 pistes claires et sans effet étouffé :
-       - voix_2 : Voix 2 — Chœur 1 (Voix Haute / Aiguë)
-       - voix_3 : Voix 3 — Chœur 2 (Voix Basse / Grave)
+    et divise directement la piste voix_2 (Chœurs) en 2 pistes distinctes :
+    - voix_2 : Voix 2 — Chœur 1 (Voix Haute / Aiguë)
+    - voix_3 : Voix 3 — Chœur 2 (Voix Basse / Grave)
     sans avoir besoin de recalculer l'IA depuis le début !
     """
     import json
-    import time
 
     meta_path = song_dir / "metadata.json"
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
 
-    # 1. Nettoyage anti-écho et clarté sur Voix 1 (avec sauvegarde brute idempotente)
-    v1_raw_wav = song_dir / "voix_1_brut.wav"
-    v1_wav = song_dir / "voix_1.wav"
-    v1_mp3 = song_dir / "voix_1.mp3"
-    if not v1_raw_wav.exists() and v1_wav.exists():
-        shutil.copyfile(v1_wav, v1_raw_wav)
-    if v1_raw_wav.exists():
-        v1_data, sr1 = sf.read(str(v1_raw_wav), dtype="float32", always_2d=True)
-        v1_clean = clean_vocal_stem(v1_data.T, sr=sr1, is_backing=False)
-        save_audio_files(v1_clean, sr1, v1_wav, v1_mp3)
-        peaks_v1 = compute_waveform_peaks(v1_clean, num_points=360)
-    else:
-        peaks_v1 = None
-
-    # 2. Sauvegarde une copie de la piste chœurs combinée si pas déjà fait
+    # Sauvegarde une copie de la piste chœurs combinée si pas déjà fait
     choir_combined_wav = song_dir / "choeurs_combines.wav"
     v2_wav = song_dir / "voix_2.wav"
     if not choir_combined_wav.exists() and v2_wav.exists():
@@ -988,8 +801,6 @@ def split_choir_in_song_dir(song_dir: Path) -> Dict[str, object]:
     new_stems = []
     for st in meta["stems"]:
         if st["id"] == "voix_1":
-            if peaks_v1 is not None:
-                st["peaks"] = peaks_v1
             new_stems.append(st)
         elif st["id"] == "voix_2":
             new_stems.append(
@@ -1018,6 +829,8 @@ def split_choir_in_song_dir(song_dir: Path) -> Dict[str, object]:
             new_stems.append(st)
 
     meta["mode"] = "lead_2choirs"
+    import time
+
     meta["version"] = int(time.time())
     meta["stems"] = new_stems
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
